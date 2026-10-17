@@ -52,6 +52,32 @@ const isCapex = e => (e.type === "expense" || e.type === "maintenance") && CAPEX
 const isDeposit = e => e.type === "income" && e.category === "Deposito cauzionale";
 const isOper = e => e.type !== "transfer" && !isCapex(e) && !isDeposit(e);
 
+/* ---- Intestazione e tasse ---- */
+const TAX_DEF = { rendita: 0, aliqImu: 10.6, rid: 25, ced: 10, canone: 0, possessoDa: "", affittoDal: "" };
+const num = v => Number(String(v ?? "").replace(",", ".")) || 0;
+// un mese conta se posseduto/affittato per più di 15 giorni
+function monthCounts(ds, y, m) {
+  if (!ds) return false;
+  const [py, pm, pd] = ds.split("-").map(Number);
+  if (y * 12 + m < py * 12 + pm) return false;
+  if (y * 12 + m > py * 12 + pm) return true;
+  return new Date(y, m, 0).getDate() - pd + 1 > 15;
+}
+function monthsFrom(ds, year) { let n = 0; for (let m = 1; m <= 12; m++) if (monthCounts(ds, year, m)) n++; return n; }
+// IMU di un semestre: mesi posseduti, con riduzione solo nei mesi affittati a canone concordato
+function imuPeriod(c, year, m1, m2) {
+  const full = c.base * num(c.t.aliqImu) / 1000 / 12; let tot = 0;
+  for (let m = m1; m <= m2; m++) if (monthCounts(c.t.possessoDa, year, m)) tot += full * (monthCounts(c.t.affittoDal, year, m) ? 1 - num(c.t.rid) / 100 : 1);
+  return tot;
+}
+function taxCalc(p) {
+  const t = { ...TAX_DEF, ...(p.tax || {}) };
+  const base = num(t.rendita) * 1.05 * 160;
+  const imuYear = base * num(t.aliqImu) / 1000 * (1 - num(t.rid) / 100);
+  const ced = num(t.ced) / 100, canone = num(t.canone);
+  return { t, base, imuYear, ced, canone, cedYear: canone * 12 * ced };
+}
+
 /* ================= STATE ================= */
 const S = {
   user: null, props: [], pid: localStorage.getItem("cocasa_pid"), activePid: null,
@@ -314,6 +340,7 @@ function viewDash(p) {
     ${p.members.map(m => `<div class="line"><span>${esc(fullName(m))}</span><span>${fmt(capQ[m]?.exp)}</span></div>`).join("")}
     ${Object.entries(deps).map(([m, v]) => `<div class="line"><span class="muted">Deposito cauzionale custodito da ${esc(memberName(m))}</span><span>${fmt(v)}</span></div>`).join("")}
   </div>` : ""}
+  ${ownershipCard(p)}
   <div class="card"><h3>Saldo tra soci</h3>
     ${st.length ? st.map(s => `<div class="line"><span><b>${esc(memberName(s.from))}</b> deve <b>${fmt(s.amount)}</b> a <b>${esc(memberName(s.to))}</b></span>
       <button class="btn sm" data-act="settle" data-from="${s.from}" data-to="${s.to}" data-amount="${s.amount}">Salda</button></div>`).join("")
@@ -325,6 +352,72 @@ function viewDash(p) {
   <div class="card"><div class="head-row"><h3>Ultimi movimenti</h3><button class="link" data-act="goto" data-tab="moves">Tutti</button></div>
     ${S.entries.slice(0, 5).map(entryRow).join("") || `<p class="muted">Ancora nessun movimento. Tocca + per aggiungerne uno.</p>`}
   </div>`;
+}
+
+function ownershipCard(p) {
+  const own = p.ownership || {};
+  if (!own.holder && !p.tax) return "";
+  const c = taxCalc(p), sh = p.defaultShares || {};
+  const quote = p.members.map(m => `${esc(memberName(m))} ${round2(Number(sh[m]) || 0)}%`).join(" · ");
+  const holder = own.holder ? `${esc(memberName(own.holder))} 100%` : "—";
+  const after = own.rogitoDate ? `dal rogito del ${fmtDate(own.rogitoDate)}` : "dopo sanatoria e rogito";
+  const tot = c.imuYear + c.cedYear;
+  return `<div class="card"><h3>Quote di proprietà</h3>
+    <div class="line"><span>Intestazione oggi</span><b>${holder}</b></div>
+    <div class="line"><span>Quote economiche (spese e affitti)</span><span>${quote}</span></div>
+    <div class="line"><span>Intestazione ${after}</span><span>${quote}</span></div>
+    ${own.status ? `<p class="muted small">Stato: ${esc(own.status)}</p>` : ""}
+    ${c.base ? `<h3 style="margin-top:12px">Tasse annue stimate</h3>
+    <div class="line"><span>IMU (${num(c.t.aliqImu)}‰, −${num(c.t.rid)}%)</span><span>${fmt(c.imuYear)}</span></div>
+    <div class="line"><span>Cedolare secca ${num(c.t.ced)}%</span><span>${fmt(c.cedYear)}</span></div>
+    <div class="line"><span><b>Totale</b></span><b>${fmt(tot)}</b></div>
+    ${p.members.map(m => `<div class="line"><span class="muted">Quota ${esc(memberName(m))}</span><span class="muted">${fmt(tot * (Number(sh[m]) || 0) / 100)}</span></div>`).join("")}
+    <p class="muted small">Fino al rogito le paga ${own.holder ? esc(memberName(own.holder)) : "l'intestatario"} e la quota del socio si scala dagli affitti. Dopo il rogito ognuno paga la sua parte. Stime da verificare con il commercialista.</p>` : ""}
+  </div>`;
+}
+
+async function genTaxSchedule(p) {
+  const c = taxCalc(p);
+  if (!c.base) return toast("Inserisci la rendita catastale");
+  if (!c.t.possessoDa) return toast("Inserisci la data di possesso");
+  const own = p.ownership || {}, holder = own.holder || S.user.uid, rog = own.rogitoDate || "";
+  const y0 = Number(c.t.possessoDa.slice(0, 4)), yEnd = Number(today().slice(0, 4)) + 1, items = [];
+  for (let y = y0; y <= yEnd; y++) {
+    items.push({ d: `${y}-06-16`, desc: `IMU acconto ${y}`, a: imuPeriod(c, y, 1, 6), cat: "IMU" });
+    items.push({ d: `${y}-12-16`, desc: `IMU saldo ${y}`, a: imuPeriod(c, y, 7, 12), cat: "IMU" });
+  }
+  if (c.t.affittoDal && c.canone) {
+    const ya = Number(c.t.affittoDal.slice(0, 4)), ced = c.canone * monthsFrom(c.t.affittoDal, ya) * c.ced;
+    items.push({ d: `${ya + 1}-06-30`, desc: `Cedolare saldo ${ya}`, a: ced, cat: "Cedolare/Tasse", fixed: true });
+    if (ced > 51.65) {
+      items.push({ d: `${ya + 1}-06-30`, desc: `Cedolare 1° acconto ${ya + 1}`, a: ced * 0.4, cat: "Cedolare/Tasse" });
+      items.push({ d: `${ya + 1}-11-30`, desc: `Cedolare 2° acconto ${ya + 1}`, a: ced * 0.6, cat: "Cedolare/Tasse" });
+    }
+  }
+  // non ricreare rate già segnate come pagate
+  const doneDesc = new Set(S.scheduled.filter(s => s.auto === "tax" && s.done).map(s => s.description));
+  const list = items.filter(i => i.a > 0.005 && !doneDesc.has(i.desc)).sort((x, z) => x.d.localeCompare(z.d));
+  const b = writeBatch(db);
+  S.scheduled.filter(s => s.auto === "tax" && !s.done).forEach(s => b.delete(doc(db, "properties", p.id, "scheduled", s.id)));
+  list.forEach(i => {
+    // dopo il rogito ognuno paga la sua quota; il saldo cedolare del primo anno resta dell'intestatario
+    const split = rog && i.d >= rog && !i.fixed;
+    b.set(doc(collection(db, "properties", p.id, "scheduled")), {
+      type: "expense", description: i.desc, amount: round2(i.a), dueDate: i.d, recurrence: "none", category: i.cat,
+      paidBy: split ? SPLIT : holder, shares: { ...(p.defaultShares || {}) }, done: false, auto: "tax",
+      createdBy: S.user.uid, updatedAt: serverTimestamp()
+    });
+  });
+  await b.commit();
+  toast(`${list.length} scadenze fiscali create ✓ (quelle passate sono in "Scadute": tocca ✓ se già pagate)`);
+}
+
+function readTaxForm() {
+  const v = id => $("#" + id)?.value ?? "";
+  return {
+    ownership: { holder: v("oHolder"), status: v("oStatus").trim(), rogitoDate: v("oRogito") },
+    tax: { rendita: num(v("tRend")), aliqImu: num(v("tAliq")), rid: num(v("tRid")), ced: num(v("tCed")), canone: num(v("tCan")), possessoDa: v("tPos"), affittoDal: v("tAff") }
+  };
 }
 
 function viewMoves() {
@@ -390,6 +483,17 @@ function viewSettings(p) {
   ${p.importedSeed ? "" : `<div class="card"><h3>Dati iniziali</h3>
     <p class="muted small">Carica acquisto, costi iniziali, spese anticipate, affitti luglio–ottobre e scadenze già calcolati. Se il socio non è ancora entrato, la sua parte va su "Socio (in attesa)" e passa a lui al primo accesso.</p>
     <button class="btn ghost block" data-act="importSeed">Importa dati iniziali</button></div>`}
+  ${(() => { const own = p.ownership || {}, t = { ...TAX_DEF, ...(p.tax || {}) }, nv = x => (x ? String(x).replace(".", ",") : "");
+    return `<div class="card"><h3>Intestazione e tasse</h3>
+    <label>Intestatario attuale (100%)${memberSelect("oHolder", own.holder || me)}</label>
+    <label>Stato<input id="oStatus" value="${esc(own.status || "")}" placeholder="es. In attesa della sanatoria"></label>
+    <label>Data rogito quota socio (se fissata)<input id="oRogito" type="date" value="${esc(own.rogitoDate || "")}"></label>
+    <div class="grid2"><label>Rendita catastale €<input id="tRend" inputmode="decimal" value="${nv(t.rendita)}"></label><label>Aliquota IMU ‰<input id="tAliq" inputmode="decimal" value="${nv(t.aliqImu)}"></label></div>
+    <div class="grid2"><label>Riduzione IMU concordato %<input id="tRid" inputmode="decimal" value="${nv(t.rid)}"></label><label>Cedolare secca %<input id="tCed" inputmode="decimal" value="${nv(t.ced)}"></label></div>
+    <div class="grid2"><label>Canone mensile €<input id="tCan" inputmode="decimal" value="${nv(t.canone)}"></label><label>Possesso dal<input id="tPos" type="date" value="${esc(t.possessoDa)}"></label></div>
+    <label>Affitto dal<input id="tAff" type="date" value="${esc(t.affittoDal)}"></label>
+    <div class="actions"><button class="btn ghost" data-act="saveTax">Salva</button><button class="btn" data-act="genTax">Salva e genera scadenze tasse</button></div>
+    <p class="muted small">Le scadenze fiscali generate prima vengono sostituite. Fino al rogito: "Pagato da" l'intestatario con quote 50/50; dopo: "Insieme".</p></div>`; })()}
   <div class="card"><h3>Il tuo nome</h3>
     <div class="inline"><input id="myName" value="${esc(p.memberInfo?.[me]?.name || "")}"><button class="btn" data-act="saveName">Salva</button></div></div>
   <div class="card"><button class="btn ghost block" data-act="newProp">+ Aggiungi un altro immobile</button></div>
@@ -444,6 +548,12 @@ $("#view").addEventListener("click", async ev => {
       }
       case "newProp": openNewProp(); break;
       case "importSeed": await importSeed(p); break;
+      case "saveTax": await updateDoc(doc(db, "properties", S.pid), readTaxForm()); toast("Salvato ✓"); break;
+      case "genTax": {
+        const f = readTaxForm();
+        await updateDoc(doc(db, "properties", S.pid), f);
+        await genTaxSchedule({ ...p, ...f }); break;
+      }
       case "logout": await signOut(auth); break;
       case "create": {
         const name = $("#obName").value.trim(); if (!name) return toast("Inserisci un nome");
