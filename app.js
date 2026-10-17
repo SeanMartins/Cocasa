@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDoc, onSnapshot, writeBatch, query, where, orderBy, serverTimestamp, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDoc, getDocs, onSnapshot, writeBatch, query, where, orderBy, serverTimestamp, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 const fb = initializeApp(firebaseConfig);
@@ -45,7 +45,9 @@ const RECUR = {
 
 // Costi iniziali: fuori dal netto annuale, mostrati come "Investimento"
 const CAPEX = ["Acquisto immobile", "Imposta di registro", "Notaio", "Pratiche tecniche", "Volture/Allacci"];
-const SPLIT = "_split"; // pagato insieme: ognuno ha versato la sua quota
+const SPLIT = "_split";
+const PH = "_partner"; // socio invitato che non ha ancora fatto l'accesso
+const PH_INFO = { name: "Socio (in attesa)", email: "" }; // pagato insieme: ognuno ha versato la sua quota
 const isCapex = e => (e.type === "expense" || e.type === "maintenance") && CAPEX.includes(e.category);
 const isDeposit = e => e.type === "income" && e.category === "Deposito cauzionale";
 const isOper = e => e.type !== "transfer" && !isCapex(e) && !isDeposit(e);
@@ -168,10 +170,32 @@ async function acceptInvite(u) {
       [`memberInfo.${u.uid}`]: { name: u.displayName || email, email }
     });
     await deleteDoc(ref);
+    await migratePartner(pid, u.uid);
     S.pid = pid; localStorage.setItem("cocasa_pid", pid);
     toast("Sei stato aggiunto all'immobile ✓");
     return true;
   } catch (e) { console.warn(e); return false; }
+}
+
+// Sostituisce il segnaposto "Socio (in attesa)" con l'account reale in movimenti, scadenze e quote
+async function migratePartner(pid, uid) {
+  const pref = doc(db, "properties", pid);
+  const P = (await getDoc(pref)).data();
+  if (!P?.members?.includes(PH)) return;
+  const sw = o => { if (!o || !(PH in o)) return o; const n = { ...o }; n[uid] = n[PH]; delete n[PH]; return n; };
+  const b = writeBatch(db);
+  for (const c of ["entries", "scheduled"]) {
+    const qs = await getDocs(collection(db, "properties", pid, c));
+    qs.forEach(d => {
+      const x = d.data(), upd = {};
+      if (x.shares && PH in x.shares) upd.shares = sw(x.shares);
+      ["paidBy", "from", "to"].forEach(k => { if (x[k] === PH) upd[k] = uid; });
+      if (Object.keys(upd).length) b.update(d.ref, upd);
+    });
+  }
+  const mi = { ...(P.memberInfo || {}) }; delete mi[PH];
+  b.update(pref, { members: P.members.filter(m => m !== PH), defaultShares: sw(P.defaultShares || {}), memberInfo: mi });
+  await b.commit();
 }
 
 function subscribeProps() {
@@ -274,7 +298,7 @@ function viewDash(p) {
   const up = S.scheduled.filter(s => !s.done && daysTo(s.dueDate) <= 30);
   return `
   ${sharesOk(p) ? "" : `<div class="warn" data-act="goto" data-tab="settings">⚠️ Le quote predefinite dei soci non sommano al 100%. Tocca per impostarle.</div>`}
-  ${p.members.length < 2 ? `<div class="warn" data-act="goto" data-tab="settings">👥 Invita il tuo socio dalle Impostazioni.</div>` : ""}
+  ${p.members.length < 2 || (p.members.includes(PH) && !(p.pendingInvites || []).length) ? `<div class="warn" data-act="goto" data-tab="settings">👥 Invita il tuo socio dalle Impostazioni.</div>` : ""}
   <div class="head-row"><h2>Riepilogo</h2>${yearSelect()}</div>
   <div class="kpis">
     <div class="kpi"><span>Entrate</span><b class="pos">${fmt(inc)}</b></div>
@@ -364,7 +388,7 @@ function viewSettings(p) {
       <button class="link danger" data-act="cancelInvite" data-email="${esc(e)}">Annulla</button></div>`).join("")}
   </div>
   ${p.importedSeed ? "" : `<div class="card"><h3>Dati iniziali</h3>
-    <p class="muted small">Carica acquisto, costi iniziali, spese anticipate, affitti luglio–ottobre e scadenze già calcolati. Serve che il socio abbia già fatto l'accesso.</p>
+    <p class="muted small">Carica acquisto, costi iniziali, spese anticipate, affitti luglio–ottobre e scadenze già calcolati. Se il socio non è ancora entrato, la sua parte va su "Socio (in attesa)" e passa a lui al primo accesso.</p>
     <button class="btn ghost block" data-act="importSeed">Importa dati iniziali</button></div>`}
   <div class="card"><h3>Il tuo nome</h3>
     <div class="inline"><input id="myName" value="${esc(p.memberInfo?.[me]?.name || "")}"><button class="btn" data-act="saveName">Salva</button></div></div>
@@ -408,7 +432,9 @@ $("#view").addEventListener("click", async ev => {
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return toast("Email non valida");
         if (Object.values(p.memberInfo || {}).some(m => m.email === email)) return toast("È già socio");
         await setDoc(doc(db, "invites", email), { pid: S.pid, propertyName: p.name, invitedBy: S.user.uid, createdAt: serverTimestamp() });
-        await updateDoc(doc(db, "properties", S.pid), { pendingInvites: arrayUnion(email) });
+        const upd = { pendingInvites: arrayUnion(email) };
+        if (p.members.length === 1) Object.assign(upd, { members: arrayUnion(PH), [`memberInfo.${PH}`]: PH_INFO, defaultShares: { [S.user.uid]: 50, [PH]: 50 } });
+        await updateDoc(doc(db, "properties", S.pid), upd);
         toast("Invito creato. Avvisa il tuo socio di aprire l'app ✓"); break;
       }
       case "cancelInvite": {
@@ -442,8 +468,7 @@ async function createProperty(name, address) {
 
 async function importSeed(p) {
   if (p.importedSeed) return toast("Dati già importati");
-  const me = S.user.uid, other = p.members.find(m => m !== me);
-  if (!other) return toast("Prima il tuo socio deve accedere all'app con l'invito");
+  const me = S.user.uid, other = p.members.find(m => m !== me) || PH;
   if (!confirm("Importare i movimenti e le scadenze iniziali?")) return;
   const { SEED } = await import("./seed-data.js");
   const sh = { [me]: 50, [other]: 50 };
@@ -456,7 +481,9 @@ async function importSeed(p) {
   for (const s of SEED.scheduled) b.set(doc(collection(db, "properties", p.id, "scheduled")), {
     ...s, paidBy: who(s.paidBy), shares: sh, done: false, createdBy: me, updatedAt: now
   });
-  b.update(doc(db, "properties", p.id), { importedSeed: true, defaultShares: sh });
+  const pu = { importedSeed: true, defaultShares: sh };
+  if (other === PH && !p.members.includes(PH)) Object.assign(pu, { members: arrayUnion(PH), [`memberInfo.${PH}`]: PH_INFO });
+  b.update(doc(db, "properties", p.id), pu);
   await b.commit();
   S.tab = "dash"; render(true);
   toast(`Importati ${SEED.entries.length} movimenti e ${SEED.scheduled.length} scadenze ✓`);
