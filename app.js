@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDoc, onSnapshot, query, where, orderBy, serverTimestamp, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDoc, onSnapshot, writeBatch, query, where, orderBy, serverTimestamp, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 const fb = initializeApp(firebaseConfig);
@@ -34,7 +34,7 @@ function toast(msg) {
 
 const TYPES = {
   income: { label: "Entrata", icon: "↓", who: "Incassato da", cats: ["Affitto", "Deposito cauzionale", "Rimborso spese", "Altra entrata"] },
-  expense: { label: "Spesa", icon: "↑", who: "Pagato da", cats: ["IMU", "Condominio", "Assicurazione", "Utenze", "Imposta di registro", "Cedolare/Tasse", "Commercialista", "Mutuo", "Arredo", "Altra spesa"] },
+  expense: { label: "Spesa", icon: "↑", who: "Pagato da", cats: ["Acquisto immobile", "Imposta di registro", "Notaio", "Pratiche tecniche", "Volture/Allacci", "IMU", "Condominio", "Assicurazione", "Utenze", "Cedolare/Tasse", "Commercialista", "Mutuo", "Arredo", "Altra spesa"] },
   maintenance: { label: "Manutenzione", icon: "🔧", who: "Pagato da", cats: ["Ordinaria", "Straordinaria", "Idraulico", "Elettricista", "Caldaia/Clima", "Imbiancatura", "Elettrodomestici", "Infissi", "Altro"] },
   transfer: { label: "Conguaglio", icon: "⇄", who: "", cats: ["Conguaglio"] }
 };
@@ -42,6 +42,13 @@ const RECUR = {
   none: { label: "Una tantum", m: 0 }, monthly: { label: "Mensile", m: 1 }, bimonthly: { label: "Bimestrale", m: 2 },
   quarterly: { label: "Trimestrale", m: 3 }, semiannual: { label: "Semestrale", m: 6 }, yearly: { label: "Annuale", m: 12 }
 };
+
+// Costi iniziali: fuori dal netto annuale, mostrati come "Investimento"
+const CAPEX = ["Acquisto immobile", "Imposta di registro", "Notaio", "Pratiche tecniche", "Volture/Allacci"];
+const SPLIT = "_split"; // pagato insieme: ognuno ha versato la sua quota
+const isCapex = e => (e.type === "expense" || e.type === "maintenance") && CAPEX.includes(e.category);
+const isDeposit = e => e.type === "income" && e.category === "Deposito cauzionale";
+const isOper = e => e.type !== "transfer" && !isCapex(e) && !isDeposit(e);
 
 /* ================= STATE ================= */
 const S = {
@@ -52,7 +59,7 @@ let propUnsub = null, subUnsubs = [];
 const prop = () => S.props.find(p => p.id === S.pid);
 const members = () => prop()?.members || [];
 const fullName = uid => prop()?.memberInfo?.[uid]?.name || "Socio";
-const memberName = uid => (uid ? fullName(uid).split(" ")[0] : "—");
+const memberName = uid => (uid === SPLIT ? "Insieme" : uid ? fullName(uid).split(" ")[0] : "—");
 
 /* ================= CALCOLI ================= */
 // Saldo: positivo = il socio è a credito (ha anticipato più della sua quota)
@@ -61,6 +68,7 @@ function computeBalances(p, entries) {
   for (const e of entries) {
     const a = Number(e.amount) || 0;
     if (e.type === "transfer") { bal[e.from] = (bal[e.from] || 0) + a; bal[e.to] = (bal[e.to] || 0) - a; continue; }
+    if (isDeposit(e) || e.paidBy === SPLIT) continue; // deposito resta a chi lo custodisce; spese pagate insieme già in pari
     const sh = e.shares || p.defaultShares || {};
     for (const m of Object.keys(sh)) {
       const part = a * (Number(sh[m]) || 0) / 100;
@@ -109,12 +117,15 @@ function projected12() {
   return t;
 }
 function reportData(p, year) {
-  const ye = S.entries.filter(e => e.date?.startsWith(year) && e.type !== "transfer");
+  const all = S.entries.filter(e => e.date?.startsWith(year) && e.type !== "transfer");
+  const ye = all.filter(isOper);
+  const cap = all.filter(isCapex), capByCat = {};
+  cap.forEach(e => (capByCat[e.category] = (capByCat[e.category] || 0) + (Number(e.amount) || 0)));
   const byCat = { income: {}, expense: {}, maintenance: {} };
   ye.forEach(e => { const c = e.category || "Altro"; byCat[e.type][c] = (byCat[e.type][c] || 0) + (Number(e.amount) || 0); });
   const tot = {};
   ["income", "expense", "maintenance"].forEach(t => (tot[t] = sumAmt(ye.filter(e => e.type === t))));
-  return { ye, byCat, tot, q: memberQuotas(p, ye) };
+  return { all, ye, byCat, tot, q: memberQuotas(p, ye), cap, capByCat, capTot: sumAmt(cap), capQ: memberQuotas(p, cap), dep: sumAmt(all.filter(isDeposit)) };
 }
 
 /* ================= AUTH ================= */
@@ -251,7 +262,9 @@ function schedRow(s) {
 }
 
 function viewDash(p) {
-  const ye = S.entries.filter(e => e.date?.startsWith(S.year));
+  const ye = S.entries.filter(e => e.date?.startsWith(S.year) && isOper(e));
+  const cap = S.entries.filter(isCapex), capQ = memberQuotas(p, cap);
+  const deps = {}; S.entries.filter(isDeposit).forEach(e => (deps[e.paidBy] = (deps[e.paidBy] || 0) + (Number(e.amount) || 0)));
   const inc = sumAmt(ye.filter(e => e.type === "income"));
   const exp = sumAmt(ye.filter(e => e.type === "expense"));
   const man = sumAmt(ye.filter(e => e.type === "maintenance"));
@@ -273,6 +286,10 @@ function viewDash(p) {
     ${p.members.map(m => { const x = q[m] || { inc: 0, exp: 0 }; const n = x.inc - x.exp;
       return `<div class="line"><span>${esc(fullName(m))}</span><span class="${n >= 0 ? "pos" : "neg"}">${fmt(n)}</span></div>`; }).join("")}
   </div>
+  ${cap.length ? `<div class="card"><h3>Investimento iniziale · ${fmt(sumAmt(cap))}</h3>
+    ${p.members.map(m => `<div class="line"><span>${esc(fullName(m))}</span><span>${fmt(capQ[m]?.exp)}</span></div>`).join("")}
+    ${Object.entries(deps).map(([m, v]) => `<div class="line"><span class="muted">Deposito cauzionale custodito da ${esc(memberName(m))}</span><span>${fmt(v)}</span></div>`).join("")}
+  </div>` : ""}
   <div class="card"><h3>Saldo tra soci</h3>
     ${st.length ? st.map(s => `<div class="line"><span><b>${esc(memberName(s.from))}</b> deve <b>${fmt(s.amount)}</b> a <b>${esc(memberName(s.to))}</b></span>
       <button class="btn sm" data-act="settle" data-from="${s.from}" data-to="${s.to}" data-amount="${s.amount}">Salda</button></div>`).join("")
@@ -316,6 +333,8 @@ function viewReport(p) {
   <div class="card"><h3>Entrate · ${fmt(r.tot.income)}</h3>${catList("income")}</div>
   <div class="card"><h3>Spese · ${fmt(r.tot.expense)}</h3>${catList("expense")}</div>
   <div class="card"><h3>Manutenzioni · ${fmt(r.tot.maintenance)}</h3>${catList("maintenance")}</div>
+  ${r.cap.length ? `<div class="card"><h3>Costi iniziali · ${fmt(r.capTot)}</h3>${Object.entries(r.capByCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => `<div class="line"><span>${esc(c)}</span><span>${fmt(v)}</span></div>`).join("")}
+    <p class="muted small">Esclusi dal netto annuale.${r.dep ? ` Depositi cauzionali incassati: ${fmt(r.dep)} (non sono entrate).` : ""}</p></div>` : ""}
   <div class="card"><h3>Per socio</h3>
     <table class="tbl"><tr><th>Socio</th><th>Entrate</th><th>Spese</th><th>Netto</th></tr>
     ${p.members.map(m => { const x = r.q[m] || { inc: 0, exp: 0 };
@@ -344,6 +363,9 @@ function viewSettings(p) {
     ${(p.pendingInvites || []).map(e => `<div class="line"><span>${esc(e)} <small class="muted">in attesa</small></span>
       <button class="link danger" data-act="cancelInvite" data-email="${esc(e)}">Annulla</button></div>`).join("")}
   </div>
+  ${p.importedSeed ? "" : `<div class="card"><h3>Dati iniziali</h3>
+    <p class="muted small">Carica acquisto, costi iniziali, spese anticipate, affitti luglio–ottobre e scadenze già calcolati. Serve che il socio abbia già fatto l'accesso.</p>
+    <button class="btn ghost block" data-act="importSeed">Importa dati iniziali</button></div>`}
   <div class="card"><h3>Il tuo nome</h3>
     <div class="inline"><input id="myName" value="${esc(p.memberInfo?.[me]?.name || "")}"><button class="btn" data-act="saveName">Salva</button></div></div>
   <div class="card"><button class="btn ghost block" data-act="newProp">+ Aggiungi un altro immobile</button></div>
@@ -395,6 +417,7 @@ $("#view").addEventListener("click", async ev => {
         await updateDoc(doc(db, "properties", S.pid), { pendingInvites: arrayRemove(email) }); break;
       }
       case "newProp": openNewProp(); break;
+      case "importSeed": await importSeed(p); break;
       case "logout": await signOut(auth); break;
       case "create": {
         const name = $("#obName").value.trim(); if (!name) return toast("Inserisci un nome");
@@ -417,12 +440,34 @@ async function createProperty(name, address) {
   toast("Immobile creato. Ora invita il tuo socio ✓");
 }
 
+async function importSeed(p) {
+  if (p.importedSeed) return toast("Dati già importati");
+  const me = S.user.uid, other = p.members.find(m => m !== me);
+  if (!other) return toast("Prima il tuo socio deve accedere all'app con l'invito");
+  if (!confirm("Importare i movimenti e le scadenze iniziali?")) return;
+  const { SEED } = await import("./seed-data.js");
+  const sh = { [me]: 50, [other]: 50 };
+  const who = w => (w === "me" ? me : w === "both" ? SPLIT : other);
+  const b = writeBatch(db), now = serverTimestamp();
+  for (const e of SEED.entries) b.set(doc(collection(db, "properties", p.id, "entries")), {
+    type: e.type, date: e.date, amount: e.amount, category: e.category, description: e.description, note: e.note || "",
+    paidBy: who(e.paidBy), shares: sh, hasReceipt: false, createdAt: now, createdBy: me, updatedAt: now, updatedBy: me
+  });
+  for (const s of SEED.scheduled) b.set(doc(collection(db, "properties", p.id, "scheduled")), {
+    ...s, paidBy: who(s.paidBy), shares: sh, done: false, createdBy: me, updatedAt: now
+  });
+  b.update(doc(db, "properties", p.id), { importedSeed: true, defaultShares: sh });
+  await b.commit();
+  S.tab = "dash"; render(true);
+  toast(`Importati ${SEED.entries.length} movimenti e ${SEED.scheduled.length} scadenze ✓`);
+}
+
 /* ================= MODALI ================= */
 function openModal(html) { $("#sheet").innerHTML = html; $("#modal").classList.remove("hidden"); document.body.classList.add("noscroll"); }
 function closeModal() { $("#modal").classList.add("hidden"); $("#sheet").innerHTML = ""; document.body.classList.remove("noscroll"); }
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 
-const memberSelect = (id, val) => `<select id="${id}">${members().map(m => `<option value="${m}" ${m === val ? "selected" : ""}>${esc(fullName(m))}</option>`).join("")}</select>`;
+const memberSelect = (id, val, split) => `<select id="${id}">${members().map(m => `<option value="${m}" ${m === val ? "selected" : ""}>${esc(fullName(m))}</option>`).join("")}${split && members().length > 1 ? `<option value="${SPLIT}" ${val === SPLIT ? "selected" : ""}>Insieme (ognuno la sua quota)</option>` : ""}</select>`;
 const sharesBlock = f => `<div class="field">
   <div class="lbl">Ripartizione <button type="button" class="link" data-x="equal">parti uguali</button><button type="button" class="link" data-x="default">predefinita</button></div>
   ${members().map(m => `<div class="share-row"><span>${esc(fullName(m))}</span><input type="number" inputmode="decimal" step="0.01" data-share="${m}" value="${Number(f.shares?.[m]) || 0}"><em>%</em></div>`).join("")}
@@ -498,7 +543,7 @@ function openEntry(existing, prefill = {}, onSaved) {
       ${f.type === "transfer"
         ? `<div class="grid2"><label>Chi paga${memberSelect("fFrom", f.from)}</label><label>A chi${memberSelect("fTo", f.to)}</label></div>
            <p class="muted small">Registra un rimborso tra soci per azzerare il saldo.</p>`
-        : `<label>${t.who}${memberSelect("fPaid", f.paidBy)}</label>${sharesBlock(f)}`}
+        : `<label>${t.who}${memberSelect("fPaid", f.paidBy, f.type !== "income")}</label>${sharesBlock(f)}`}
       <label>Note<textarea id="fNote" rows="2">${esc(f.note || "")}</textarea></label>
       ${f.type === "transfer" ? "" : `<div class="field"><div class="lbl">Ricevuta / fattura</div>
         <div class="inline"><label class="btn ghost sm file" style="margin:0">📷 Allega<input id="fFile" type="file" accept="image/*,application/pdf" hidden></label>
@@ -576,7 +621,7 @@ function openSched(existing) {
         <label>Ripetizione<select id="fRec">${Object.entries(RECUR).map(([k, v]) => `<option value="${k}" ${k === f.recurrence ? "selected" : ""}>${v.label}</option>`).join("")}</select></label>
         <label>Categoria<select id="fCat">${t.cats.map(c => `<option ${c === f.category ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></label>
       </div>
-      <label>Di solito paga${memberSelect("fPaid", f.paidBy)}</label>
+      <label>Di solito paga${memberSelect("fPaid", f.paidBy, true)}</label>
       ${sharesBlock(f)}
       <div class="actions">${existing ? `<button class="btn ghost danger" data-x="delete">Elimina</button>` : ""}<button class="btn" data-x="save">Salva</button></div>`);
     bindSheet(f, read, draw, {
@@ -604,7 +649,7 @@ function markPaid(s) {
   if (!s) return;
   openEntry(null, {
     type: s.type || "expense", amount: s.amount, description: s.description, category: s.category,
-    paidBy: members().includes(s.paidBy) ? s.paidBy : S.user.uid, shares: s.shares || prop().defaultShares, date: today()
+    paidBy: (s.paidBy === SPLIT || members().includes(s.paidBy)) ? s.paidBy : S.user.uid, shares: s.shares || prop().defaultShares, date: today()
   }, async () => {
     const ref = doc(db, "properties", S.pid, "scheduled", s.id);
     const m = RECUR[s.recurrence || "none"].m;
@@ -678,11 +723,12 @@ function exportPdf(p, year) {
   const cats = [];
   for (const t of ["income", "expense", "maintenance"]) Object.entries(r.byCat[t]).forEach(([c, v]) => cats.push([TYPES[t].label, c, fmtPdf(v)]));
   if (cats.length) tbl(["Tipo", "Categoria", "Importo"], cats, { columnStyles: { 2: { halign: "right" } } });
+  if (r.cap.length) tbl(["Costi iniziali", "Importo"], [...Object.entries(r.capByCat).map(([c, v]) => [c, fmtPdf(v)]), ["Totale", fmtPdf(r.capTot)]], { columnStyles: { 1: { halign: "right" } } });
   tbl(["Socio", "Quota entrate", "Quota spese", "Netto"], p.members.map(m => {
     const x = r.q[m] || { inc: 0, exp: 0 };
     return [fullName(m), fmtPdf(x.inc), fmtPdf(x.exp), fmtPdf(x.inc - x.exp)];
   }), { columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" } } });
-  const rows = [...r.ye].sort((a, b) => a.date.localeCompare(b.date)).map(e => [
+  const rows = [...r.all].sort((a, b) => a.date.localeCompare(b.date)).map(e => [
     fmtDate(e.date), TYPES[e.type].label, e.category || "", e.description || "", memberName(e.paidBy),
     (e.type === "income" ? "+" : "-") + fmtPdf(e.amount)
   ]);
