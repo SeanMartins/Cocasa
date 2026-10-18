@@ -494,6 +494,9 @@ function viewSettings(p) {
     <label>Affitto dal<input id="tAff" type="date" value="${esc(t.affittoDal)}"></label>
     <div class="actions"><button class="btn ghost" data-act="saveTax">Salva</button><button class="btn" data-act="genTax">Salva e genera scadenze tasse</button></div>
     <p class="muted small">Le scadenze fiscali generate prima vengono sostituite. Fino al rogito: "Pagato da" l'intestatario con quote 50/50; dopo: "Insieme".</p></div>`; })()}
+  ${p.importedSeed && !(p.updates || []).includes("2026-10-18") ? `<div class="card"><h3>Aggiornamento spese 18/10</h3>
+    <p class="muted small">Intesta a te architetto, diritti e perizia, aggiunge i 2 rimborsi di Fabio, il chimico e le 6 spese di Fabio, e rinomina il socio in "Fabio".</p>
+    <button class="btn block" data-act="applyUpdate">Applica aggiornamento spese</button></div>` : ""}
   <div class="card"><h3>Il tuo nome</h3>
     <div class="inline"><input id="myName" value="${esc(p.memberInfo?.[me]?.name || "")}"><button class="btn" data-act="saveName">Salva</button></div></div>
   <div class="card"><button class="btn ghost block" data-act="newProp">+ Aggiungi un altro immobile</button></div>
@@ -548,6 +551,7 @@ $("#view").addEventListener("click", async ev => {
       }
       case "newProp": openNewProp(); break;
       case "importSeed": await importSeed(p); break;
+      case "applyUpdate": await applyUpdate(p); break;
       case "saveTax": await updateDoc(doc(db, "properties", S.pid), readTaxForm()); toast("Salvato ✓"); break;
       case "genTax": {
         const f = readTaxForm();
@@ -597,6 +601,31 @@ async function importSeed(p) {
   await b.commit();
   S.tab = "dash"; render(true);
   toast(`Importati ${SEED.entries.length} movimenti e ${SEED.scheduled.length} scadenze ✓`);
+}
+
+async function applyUpdate(p) {
+  const { UPDATE } = await import("./update-1018.js");
+  if ((p.updates || []).includes(UPDATE.id)) return toast("Aggiornamento già applicato");
+  if (!confirm("Applicare l'aggiornamento spese del 18/10?")) return;
+  const me = S.user.uid, other = p.members.find(m => m !== me) || PH;
+  const who = w => (w === "me" ? me : other);
+  const sh = { ...(p.defaultShares || { [me]: 50, [other]: 50 }) };
+  const b = writeBatch(db), now = serverTimestamp();
+  S.entries.filter(e => UPDATE.setPaidByMe.includes(e.description))
+    .forEach(e => b.update(doc(db, "properties", p.id, "entries", e.id), { paidBy: me, updatedAt: now, updatedBy: me }));
+  for (const e of UPDATE.entries) {
+    const d = { type: e.type, date: e.date, amount: e.amount, category: e.category, description: e.description, note: e.note || "",
+      hasReceipt: false, createdAt: now, createdBy: me, updatedAt: now, updatedBy: me };
+    if (e.type === "transfer") { d.from = who(e.from); d.to = who(e.to); }
+    else { d.paidBy = who(e.paidBy); d.shares = sh; }
+    b.set(doc(collection(db, "properties", p.id, "entries")), d);
+  }
+  const pu = { updates: arrayUnion(UPDATE.id) };
+  if (other === PH) pu[`memberInfo.${PH}.name`] = UPDATE.partnerName;
+  b.update(doc(db, "properties", p.id), pu);
+  await b.commit();
+  S.tab = "dash"; render(true);
+  toast("Aggiornamento applicato ✓");
 }
 
 /* ================= MODALI ================= */
