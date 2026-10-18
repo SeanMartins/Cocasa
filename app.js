@@ -34,7 +34,7 @@ function toast(msg) {
 
 const TYPES = {
   income: { label: "Entrata", icon: "↓", who: "Incassato da", cats: ["Affitto", "Deposito cauzionale", "Rimborso spese", "Altra entrata"] },
-  expense: { label: "Spesa", icon: "↑", who: "Pagato da", cats: ["Acquisto immobile", "Imposta di registro", "Notaio", "Pratiche tecniche", "Volture/Allacci", "IMU", "Condominio", "Assicurazione", "Utenze", "Cedolare/Tasse", "Commercialista", "Mutuo", "Arredo", "Altra spesa"] },
+  expense: { label: "Spesa", icon: "↑", who: "Pagato da", cats: ["Restituzione deposito", "Acquisto immobile", "Imposta di registro", "Notaio", "Pratiche tecniche", "Volture/Allacci", "IMU", "Condominio", "Assicurazione", "Utenze", "Cedolare/Tasse", "Commercialista", "Mutuo", "Arredo", "Altra spesa"] },
   maintenance: { label: "Manutenzione", icon: "🔧", who: "Pagato da", cats: ["Ordinaria", "Straordinaria", "Idraulico", "Elettricista", "Caldaia/Clima", "Imbiancatura", "Elettrodomestici", "Infissi", "Altro"] },
   transfer: { label: "Conguaglio", icon: "⇄", who: "", cats: ["Conguaglio"] }
 };
@@ -49,7 +49,7 @@ const SPLIT = "_split";
 const PH = "_partner"; // socio invitato che non ha ancora fatto l'accesso
 const PH_INFO = { name: "Socio (in attesa)", email: "" }; // pagato insieme: ognuno ha versato la sua quota
 const isCapex = e => (e.type === "expense" || e.type === "maintenance") && CAPEX.includes(e.category);
-const isDeposit = e => e.type === "income" && e.category === "Deposito cauzionale";
+const isDeposit = e => (e.type === "income" && e.category === "Deposito cauzionale") || (e.type === "expense" && e.category === "Restituzione deposito");
 const isOper = e => e.type !== "transfer" && !isCapex(e) && !isDeposit(e);
 
 /* ---- Intestazione e tasse ---- */
@@ -96,7 +96,7 @@ function computeBalances(p, entries) {
   for (const e of entries) {
     const a = Number(e.amount) || 0;
     if (e.type === "transfer") { bal[e.from] = (bal[e.from] || 0) + a; bal[e.to] = (bal[e.to] || 0) - a; continue; }
-    if (isDeposit(e) || e.paidBy === SPLIT) continue; // deposito resta a chi lo custodisce; spese pagate insieme già in pari
+    if (e.paidBy === SPLIT) continue; // spese pagate insieme: già in pari (il deposito si divide come le altre voci)
     const sh = e.shares || p.defaultShares || {};
     for (const m of Object.keys(sh)) {
       const part = a * (Number(sh[m]) || 0) / 100;
@@ -153,7 +153,7 @@ function reportData(p, year) {
   ye.forEach(e => { const c = e.category || "Altro"; byCat[e.type][c] = (byCat[e.type][c] || 0) + (Number(e.amount) || 0); });
   const tot = {};
   ["income", "expense", "maintenance"].forEach(t => (tot[t] = sumAmt(ye.filter(e => e.type === t))));
-  return { all, ye, byCat, tot, q: memberQuotas(p, ye), cap, capByCat, capTot: sumAmt(cap), capQ: memberQuotas(p, cap), dep: sumAmt(all.filter(isDeposit)) };
+  return { all, ye, byCat, tot, q: memberQuotas(p, ye), cap, capByCat, capTot: sumAmt(cap), capQ: memberQuotas(p, cap), dep: sumAmt(all.filter(e => isDeposit(e) && e.type === "income")) - sumAmt(all.filter(e => isDeposit(e) && e.type !== "income")) };
 }
 
 /* ================= AUTH ================= */
@@ -314,7 +314,7 @@ function schedRow(s) {
 function viewDash(p) {
   const ye = S.entries.filter(e => e.date?.startsWith(S.year) && isOper(e));
   const cap = S.entries.filter(isCapex), capQ = memberQuotas(p, cap);
-  const deps = {}; S.entries.filter(isDeposit).forEach(e => (deps[e.paidBy] = (deps[e.paidBy] || 0) + (Number(e.amount) || 0)));
+  const deps = {}; S.entries.filter(isDeposit).forEach(e => (deps[e.paidBy] = (deps[e.paidBy] || 0) + (e.type === "income" ? 1 : -1) * (Number(e.amount) || 0)));
   const inc = sumAmt(ye.filter(e => e.type === "income"));
   const exp = sumAmt(ye.filter(e => e.type === "expense"));
   const man = sumAmt(ye.filter(e => e.type === "maintenance"));
@@ -338,19 +338,23 @@ function viewDash(p) {
   </div>
   ${cap.length ? `<div class="card"><h3>Investimento iniziale · ${fmt(sumAmt(cap))}</h3>
     ${p.members.map(m => `<div class="line"><span>${esc(fullName(m))}</span><span>${fmt(capQ[m]?.exp)}</span></div>`).join("")}
-    ${Object.entries(deps).map(([m, v]) => `<div class="line"><span class="muted">Deposito cauzionale custodito da ${esc(memberName(m))}</span><span>${fmt(v)}</span></div>`).join("")}
+    ${Object.entries(deps).map(([m, v]) => `<div class="line"><span class="muted">Deposito cauzionale incassato da ${esc(memberName(m))} (diviso 50/50, da restituire)</span><span>${fmt(v)}</span></div>`).join("")}
   </div>` : ""}
   ${ownershipCard(p)}
-  <div class="card"><h3>Saldo tra soci</h3>
-    ${st.length ? st.map(s => `<div class="line"><span><b>${esc(memberName(s.from))}</b> deve <b>${fmt(s.amount)}</b> a <b>${esc(memberName(s.to))}</b></span>
-      <button class="btn sm" data-act="settle" data-from="${s.from}" data-to="${s.to}" data-amount="${s.amount}">Salda</button></div>`).join("")
+  <div class="card"><h3>Cassa comune</h3>
+    ${st.length ? st.map(s => `<div class="line"><span><b>${esc(memberName(s.from))}</b> tiene <b>${fmt(s.amount)}</b> di <b>${esc(memberName(s.to))}</b></span>
+      <button class="btn sm ghost" data-act="settle" data-from="${s.from}" data-to="${s.to}" data-amount="${s.amount}">Conguaglio</button></div>`).join("")
+      + `<p class="muted small">Non serve saldare: quando ${esc(memberName(st[0].from))} paga spese comuni (architetto, sanatoria…) con quota 50/50, la parte dell'altro si scala da qui.</p>`
       : `<p class="muted">Siete in pari ✓</p>`}
   </div>
   <div class="card"><div class="head-row"><h3>Scadenze vicine</h3><button class="link" data-act="goto" data-tab="sched">Tutte</button></div>
     ${up.length ? up.map(schedRow).join("") : `<p class="muted">Nessuna scadenza nei prossimi 30 giorni</p>`}
   </div>
-  <div class="card"><div class="head-row"><h3>Ultimi movimenti</h3><button class="link" data-act="goto" data-tab="moves">Tutti</button></div>
-    ${S.entries.slice(0, 5).map(entryRow).join("") || `<p class="muted">Ancora nessun movimento. Tocca + per aggiungerne uno.</p>`}
+  <div class="card"><div class="head-row"><h3>Ultime entrate</h3><button class="link" data-act="gotoF" data-f="income">Tutte</button></div>
+    ${S.entries.filter(e => e.type === "income").slice(0, 5).map(entryRow).join("") || `<p class="muted">Nessuna entrata</p>`}
+  </div>
+  <div class="card"><div class="head-row"><h3>Ultime spese</h3><button class="link" data-act="gotoF" data-f="spese">Tutte</button></div>
+    ${S.entries.filter(e => e.type === "expense" || e.type === "maintenance").slice(0, 5).map(entryRow).join("") || `<p class="muted">Nessuna spesa. Tocca + per aggiungerne una.</p>`}
   </div>`;
 }
 
@@ -421,12 +425,18 @@ function readTaxForm() {
 }
 
 function viewMoves() {
-  let list = S.entries.filter(e => e.date?.startsWith(S.year));
-  if (S.filter !== "all") list = list.filter(e => e.type === S.filter);
-  const chips = [["all", "Tutti"], ["income", "Entrate"], ["expense", "Spese"], ["maintenance", "Manutenzioni"], ["transfer", "Conguagli"]];
+  const ye = S.entries.filter(e => e.date?.startsWith(S.year));
+  const groups = [
+    ["income", "Entrate", ye.filter(e => e.type === "income")],
+    ["spese", "Spese e manutenzioni", ye.filter(e => e.type === "expense" || e.type === "maintenance")],
+    ["transfer", "Conguagli tra soci", ye.filter(e => e.type === "transfer")]
+  ];
+  const chips = [["all", "Tutti"], ["income", "Entrate"], ["spese", "Spese"], ["transfer", "Conguagli"]];
+  const show = groups.filter(([k]) => S.filter === "all" || S.filter === k || (S.filter === "expense" || S.filter === "maintenance") && k === "spese");
+  const sec = ([k, t, l]) => `<h3 class="sec">${t} · ${fmt(sumAmt(l))}</h3><div class="card">${l.map(entryRow).join("") || `<p class="muted">Nessun movimento</p>`}</div>`;
   return `<div class="head-row"><h2>Movimenti</h2>${yearSelect()}</div>
   <div class="chips">${chips.map(([k, l]) => `<button class="chip ${S.filter === k ? "on" : ""}" data-act="filter" data-f="${k}">${l}</button>`).join("")}</div>
-  <div class="card">${list.map(entryRow).join("") || `<p class="muted">Nessun movimento</p>`}</div>`;
+  ${show.filter(g => S.filter !== "all" || g[2].length).map(sec).join("") || `<div class="card"><p class="muted">Nessun movimento</p></div>`}`;
 }
 
 function viewSched() {
@@ -451,7 +461,7 @@ function viewReport(p) {
   <div class="card"><h3>Spese · ${fmt(r.tot.expense)}</h3>${catList("expense")}</div>
   <div class="card"><h3>Manutenzioni · ${fmt(r.tot.maintenance)}</h3>${catList("maintenance")}</div>
   ${r.cap.length ? `<div class="card"><h3>Costi iniziali · ${fmt(r.capTot)}</h3>${Object.entries(r.capByCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => `<div class="line"><span>${esc(c)}</span><span>${fmt(v)}</span></div>`).join("")}
-    <p class="muted small">Esclusi dal netto annuale.${r.dep ? ` Depositi cauzionali incassati: ${fmt(r.dep)} (non sono entrate).` : ""}</p></div>` : ""}
+    <p class="muted small">Esclusi dal netto annuale.${r.dep ? ` Depositi cauzionali: ${fmt(r.dep)} (divisi tra i soci, non sono reddito).` : ""}</p></div>` : ""}
   <div class="card"><h3>Per socio</h3>
     <table class="tbl"><tr><th>Socio</th><th>Entrate</th><th>Spese</th><th>Netto</th></tr>
     ${p.members.map(m => { const x = r.q[m] || { inc: 0, exp: 0 };
@@ -519,6 +529,7 @@ $("#view").addEventListener("click", async ev => {
       case "settle": openEntry(null, { type: "transfer", from: el.dataset.from, to: el.dataset.to, amount: Number(el.dataset.amount), category: "Conguaglio", description: "Conguaglio saldo" }); break;
       case "filter": S.filter = el.dataset.f; render(true); break;
       case "goto": S.tab = el.dataset.tab; render(true); window.scrollTo(0, 0); break;
+      case "gotoF": S.tab = "moves"; S.filter = el.dataset.f; render(true); window.scrollTo(0, 0); break;
       case "pdf": exportPdf(p, S.year); break;
       case "saveProp": {
         const name = $("#pName").value.trim(); if (!name) return toast("Inserisci un nome");
