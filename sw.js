@@ -1,4 +1,4 @@
-const CACHE = "cocasa-v8";
+const CACHE = "cocasa-v9";
 const ASSETS = ["./", "index.html", "app.js", "firebase-config.js", "manifest.json", "icon.svg"];
 
 self.addEventListener("install", e => {

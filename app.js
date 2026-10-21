@@ -452,6 +452,80 @@ function viewSched() {
   ${S.scheduled.length ? "" : `<div class="card"><p class="muted">Aggiungi IMU, condominio, assicurazione, revisione caldaia… con il tasto +. Quando ne paghi una tocca ✓: viene registrata la spesa e, se ricorrente, spostata alla prossima scadenza.</p></div>`}`;
 }
 
+/* ---- Spese per socio (come il PDF condiviso) ---- */
+const EXCL_SOCI = ["Acquisto immobile", "Imposta di registro"];
+function speseSoci(p) {
+  const sp = S.entries.filter(e => (e.type === "expense" || e.type === "maintenance") && !EXCL_SOCI.includes(e.category) && !isDeposit(e))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const tr = S.entries.filter(e => e.type === "transfer").sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const joint = sp.filter(e => e.paidBy === SPLIT);
+  const per = p.members.map(m => {
+    const list = sp.filter(e => e.paidBy === m);
+    const paid = sumAmt(list);
+    const recv = tr.filter(t => t.to === m), given = tr.filter(t => t.from === m);
+    const net = paid - sumAmt(recv) + sumAmt(given);
+    const quota = sp.filter(e => e.paidBy !== SPLIT).reduce((a, e) => a + (Number(e.amount) || 0) * (Number((e.shares || p.defaultShares || {})[m]) || 0) / 100, 0);
+    return { m, list, paid, recv, given, net, quota, diff: net - quota };
+  });
+  return { per, joint, tot: sumAmt(sp.filter(e => e.paidBy !== SPLIT)), jointTot: sumAmt(joint) };
+}
+function viewSpeseSoci(p) {
+  const d = speseSoci(p);
+  const row = e => `<div class="row" data-act="entry" data-id="${e.id}"><div class="grow"><div class="t">${esc(e.description || e.category)}</div>
+    <div class="s">${fmtDate(e.date)} · ${esc(e.category)}${e.hasReceipt ? " · 📎" : ""}</div></div><div class="amt">${fmt(e.amount)}</div></div>`;
+  const cards = d.per.map(x => `<div class="card"><h3>Pagate da ${esc(memberName(x.m))}</h3>
+    ${x.list.map(row).join("") || `<p class="muted">Nessuna spesa</p>`}
+    <div class="line"><b>Totale pagato</b><b>${fmt(x.paid)}</b></div>
+    ${x.recv.map(t => `<div class="line"><span class="muted">Rimborso da ${esc(memberName(t.from))} · ${fmtDate(t.date)}</span><span>−${fmt(t.amount)}</span></div>`).join("")}
+    ${x.given.map(t => `<div class="line"><span class="muted">Rimborso a ${esc(memberName(t.to))} · ${fmtDate(t.date)}</span><span>+${fmt(t.amount)}</span></div>`).join("")}
+    <div class="line"><b>Totale netto ${esc(memberName(x.m))}</b><b>${fmt(x.net)}</b></div></div>`).join("");
+  const cong = d.per.map(x => `<div class="line"><span>${esc(memberName(x.m))}: versato ${fmt(x.net)} · quota ${fmt(x.quota)}</span><span class="${x.diff >= 0 ? "pos" : "neg"}">${x.diff >= 0 ? "+" : "−"}${fmt(Math.abs(x.diff))}</span></div>`).join("");
+  const cred = d.per.find(x => x.diff > 0.005), deb = d.per.find(x => x.diff < -0.005);
+  return `<h3 class="sec">Spese per socio · dall'inizio</h3>
+  ${cards}
+  ${d.joint.length ? `<div class="card"><h3>Pagate insieme (metà ciascuno)</h3>${d.joint.map(row).join("")}<div class="line"><b>Totale</b><b>${fmt(d.jointTot)}</b></div></div>` : ""}
+  <div class="card"><h3>Conguaglio spese</h3>
+    <div class="line"><span>Totale spese</span><b>${fmt(d.tot)}</b></div>${cong}
+    <div class="line"><b>${cred && deb ? `${esc(memberName(deb.m))} deve a ${esc(memberName(cred.m))}` : "Siete in pari"}</b><b>${cred && deb ? fmt(cred.diff) : "✓"}</b></div>
+    <p class="muted small">Esclusi acquisto, imposta di registro, affitti e deposito cauzionale.</p>
+  </div>
+  <button class="btn block ghost" data-act="pdfSoci">Scarica PDF spese per socio</button>`;
+}
+function exportPdfSoci(p) {
+  if (!window.jspdf) return toast("Libreria PDF non ancora caricata, riprova");
+  const { jsPDF } = window.jspdf, d = new jsPDF(), x = speseSoci(p);
+  d.setFontSize(16); d.setTextColor(15, 118, 110); d.text(`${p.name} - Spese per socio`, 14, 18);
+  d.setFontSize(9); d.setTextColor(110);
+  d.text(`Aggiornato al ${fmtDate(today())}. Esclusi acquisto, imposta di registro, affitti e deposito cauzionale.`, 14, 25);
+  d.setTextColor(0);
+  let y = 32;
+  const head = { fillColor: [15, 118, 110] }, foot = { fillColor: [230, 242, 241], textColor: 0, fontStyle: "bold" };
+  for (const s of x.per) {
+    d.setFontSize(12); d.text(`Pagate da ${memberName(s.m)}`, 14, y); y += 3;
+    const foots = [["Totale pagato", "", fmtPdf(s.paid)],
+      ...s.recv.map(t => [`Rimborso da ${memberName(t.from)} (${fmtDate(t.date)})`, "", "-" + fmtPdf(t.amount)]),
+      ...s.given.map(t => [`Rimborso a ${memberName(t.to)} (${fmtDate(t.date)})`, "", "+" + fmtPdf(t.amount)]),
+      [`Totale netto ${memberName(s.m)}`, "", fmtPdf(s.net)]];
+    d.autoTable({ startY: y, head: [["Spesa", "Data", "Costo"]], body: s.list.map(e => [e.description || e.category, fmtDate(e.date), fmtPdf(e.amount)]),
+      foot: foots, showFoot: "lastPage", headStyles: head, footStyles: foot, styles: { fontSize: 9 }, columnStyles: { 2: { halign: "right" } } });
+    y = d.lastAutoTable.finalY + 10;
+  }
+  if (x.joint.length) {
+    d.setFontSize(12); d.text("Pagate insieme (meta ciascuno)", 14, y); y += 3;
+    d.autoTable({ startY: y, head: [["Spesa", "Data", "Costo"]], body: x.joint.map(e => [e.description || e.category, fmtDate(e.date), fmtPdf(e.amount)]),
+      headStyles: head, styles: { fontSize: 9 }, columnStyles: { 2: { halign: "right" } } });
+    y = d.lastAutoTable.finalY + 10;
+  }
+  const cred = x.per.find(s => s.diff > 0.005), deb = x.per.find(s => s.diff < -0.005);
+  d.setFontSize(12); d.text("Conguaglio spese", 14, y); y += 3;
+  d.autoTable({ startY: y, body: [["Totale spese", fmtPdf(x.tot)],
+    ...x.per.flatMap(s => [[`Quota ${memberName(s.m)}`, fmtPdf(s.quota)], [`Versato da ${memberName(s.m)}`, fmtPdf(s.net)]]),
+    [cred && deb ? `${memberName(deb.m)} deve a ${memberName(cred.m)}` : "Siete in pari", cred && deb ? fmtPdf(cred.diff) : "-"]],
+    styles: { fontSize: 10 }, columnStyles: { 1: { halign: "right" } },
+    didParseCell: h => { if (h.row.index === h.table.body.length - 1) { h.cell.styles.fontStyle = "bold"; h.cell.styles.fillColor = [255, 244, 204]; } } });
+  d.save(`spese-per-socio-${(p.name || "immobile").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.pdf`);
+}
+
 function viewReport(p) {
   const r = reportData(p, S.year);
   const catList = t => Object.entries(r.byCat[t]).sort((a, b) => b[1] - a[1])
@@ -469,7 +543,8 @@ function viewReport(p) {
     </table>
     <p class="muted small">Le quote di entrata sono i canoni pro-quota di ciascun socio. Da verificare con il commercialista per la dichiarazione.</p>
   </div>
-  <button class="btn block" data-act="pdf">Scarica PDF ${S.year}</button>`;
+  <button class="btn block" data-act="pdf">Scarica PDF ${S.year}</button>
+  ${viewSpeseSoci(p)}`;
 }
 
 function viewSettings(p) {
@@ -531,6 +606,7 @@ $("#view").addEventListener("click", async ev => {
       case "goto": S.tab = el.dataset.tab; render(true); window.scrollTo(0, 0); break;
       case "gotoF": S.tab = "moves"; S.filter = el.dataset.f; render(true); window.scrollTo(0, 0); break;
       case "pdf": exportPdf(p, S.year); break;
+      case "pdfSoci": exportPdfSoci(p); break;
       case "saveProp": {
         const name = $("#pName").value.trim(); if (!name) return toast("Inserisci un nome");
         await updateDoc(doc(db, "properties", S.pid), { name, address: $("#pAddr").value.trim() }); toast("Salvato ✓"); break;
